@@ -175,6 +175,21 @@ async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicSe
 
 	return true;
 }
+
+
+const corsHeaders = {
+	'Access-Control-Allow-Origin': '*',
+	'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, HEAD, OPTIONS',
+	'Access-Control-Max-Age': '86400',
+	'Access-Control-Allow-Headers': 'x-worker-key,Content-Type,x-custom-metadata,Content-MD5,x-amz-meta-fileid,x-amz-meta-account_id,x-amz-meta-clientid,x-amz-meta-file_id,x-amz-meta-opportunity_id,x-amz-meta-client_id,x-amz-meta-webhook,authorization',
+	'Access-Control-Allow-Credentials': 'true',
+	'Allow': 'GET, POST, PUT, DELETE, HEAD, OPTIONS'
+};
+
+function corsRes(res: string, status: number) {
+	return new Response(res, { headers: corsHeaders, status });
+}
+
 export default {
 	async fetch(request: Request) {
 		const url = new URL(request.url);
@@ -183,30 +198,36 @@ export default {
 			const body = await request.text();
 			const { clinicServer, clinicKey, deviceToken, accountId } = JSON.parse(body) as { clinicServer: string, clinicKey: string, deviceToken: string, accountId: string };
 			const result = await putDevice({ clinicServer, clinicKey, deviceToken, accountId });
-			if (typeof result == "string") return new Response(result, { status: 400 });
-			return new Response("ok", { status: 200 });
+			if (typeof result == "string") return corsRes(result, 400);
+			return corsRes("ok", 200);
 		}
 
 		if (url.pathname == "/replace-token" && request.method == "POST") {
 			const body = await request.text();
 			const { clinicServer, clinicKey, oldToken, newToken } = JSON.parse(body) as { clinicServer: string, clinicKey: string, oldToken: string, newToken: string };
 			const result = await replaceToken({ clinicServer, clinicKey, oldToken, newToken });
-			if (typeof result == "string") return new Response(result, { status: 400 });
-			return new Response("ok", { status: 200 });
+			if (typeof result == "string") return corsRes(result, 400);
+			return corsRes("ok", 200);
 		}
 
 		if (url.pathname == "/push" && request.method == "POST") {
 			const body = await request.text();
 			const { clinicServer, clinicKey, accountId, data } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountId: string, data: Object };
 			const result = await pushData({ clinicServer, clinicKey, accountId, data });
-			if (typeof result == "string") return new Response(result, { status: 400 });
-			return new Response("ok", { status: 200 });
+			if (typeof result == "string") return corsRes(result, 400);
+			return corsRes("ok", 200);
 		}
 
 		if (url.pathname == "/health" && request.method == "GET") {
-			return new Response("ok", { status: 200 });
+			return corsRes("ok", 200);
 		}
 
-		return new Response(`unknown path or method: ${url.pathname}`, { status: 404 });
+		if (request.method === "OPTIONS") {
+			return new Response("OK", {
+				headers: corsHeaders
+			});
+		}
+
+		return corsRes(`unknown path or method: ${url.pathname}`, 404);
 	}
 } satisfies ExportedHandler<Env>;
