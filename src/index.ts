@@ -129,7 +129,7 @@ async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicSe
 	const tokens = Object.keys(clinic.devices);
 
 	const IDsPresent = IDs.filter((id) => id == accountId);
-	if (IDsPresent.length == 0) return "account not found";
+	if (IDsPresent.length == 0) return "account not found: " + accountId;
 
 	if (clinic.key != clinicKey) return "clinic key does not match";
 
@@ -156,8 +156,11 @@ async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicSe
 
 	for (let index = 0; index < responses.length; index++) {
 		const response = responses[index];
-		if (response.status == 400 || response.status == 404) {
+		if (response.status == 404) {
 			failedTokens.push(requests[index][0]);
+		}
+		else if (response.status != 200) {
+			return await response.text();
 		}
 	}
 
