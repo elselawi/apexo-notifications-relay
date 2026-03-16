@@ -65,6 +65,8 @@ async function replaceToken({ clinicServer, clinicKey, oldToken, newToken }: { c
 		if (arg == "" || arg == null) return "missing parameters";
 	}
 
+	if (oldToken === newToken) return true;
+
 	clinicKey = await hashKey(clinicKey);
 
 	const value = await env.apexo_notifications_relay.get(clinicServer);
