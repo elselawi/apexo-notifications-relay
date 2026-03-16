@@ -45,8 +45,8 @@ async function putDevice({ clinicServer, clinicKey, deviceToken, accountId }: { 
 	if (value != null) {
 		const clinic = new ClinicServer({ server: clinicServer, value });
 		if (clinic.key == clinicKey) {
-			// add device token only if not already present
-			if (clinic.devices[deviceToken]) return true;
+			// add or update device token
+			if (clinic.devices[deviceToken] === accountId) return true;
 			clinic.devices[deviceToken] = accountId;
 			await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 			return true
@@ -113,8 +113,8 @@ async function getFCMAuth(): Promise<string> {
 	return res;
 }
 
-async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicServer: string, clinicKey: string, accountId: string, data: Object }): Promise<true | string> {
-	for (const arg of [clinicServer, clinicKey, accountId, data]) {
+async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object }): Promise<true | string> {
+	for (const arg of [clinicServer, clinicKey, accountIds, data]) {
 		if (arg == "" || arg == null) return "missing parameters";
 	}
 
@@ -124,43 +124,34 @@ async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicSe
 	if (value == null) return "clinic not found";
 
 	const clinic = new ClinicServer({ server: clinicServer, value });
-
-	const IDs = Object.values(clinic.devices);
-	const tokens = Object.keys(clinic.devices);
-
-	const IDsPresent = IDs.filter((id) => id == accountId);
-	if (IDsPresent.length == 0) return "account not found: " + accountId;
-
 	if (clinic.key != clinicKey) return "clinic key does not match";
+
+	// Find all tokens that belong to the target accountIds
+	const targetTokens = Object.entries(clinic.devices)
+		.filter(([_, accountId]) => accountIds.includes(accountId))
+		.map(([token]) => token);
+
+	if (targetTokens.length == 0) return "none of the account ids were found to have FCM tokens: " + accountIds;
 
 	// generate FCM access token
 	const oauth = await getFCMAuth();
 
 	const failedTokens: string[] = [];
 
-	const requests: [string, Promise<Response>][] = [];
-
-	for (let index = 0; index < IDs.length; index++) {
-		const id = IDs[index];
-		const token = tokens[index];
-
-		if (id == accountId) {
-			// send data using the token
-			// if the sending fails due to token being invalid
-			// mark it for removal when we're out of this loop
-			requests.push([token, sendFCM({ oauth, token, data })]);
-		}
-	}
+	const requests: [string, Promise<Response>][] = targetTokens.map((token) => {
+		return [token, sendFCM({ oauth, token, data })];
+	});
 
 	const responses = await Promise.all(requests.map((request) => request[1]));
 
+	let errorMsg: string | null = null;
 	for (let index = 0; index < responses.length; index++) {
 		const response = responses[index];
 		if (response.status == 404) {
 			failedTokens.push(requests[index][0]);
 		}
-		else if (response.status != 200) {
-			return await response.text();
+		else if (response.status != 200 && errorMsg == null) {
+			errorMsg = await response.text();
 		}
 	}
 
@@ -173,6 +164,7 @@ async function pushData({ clinicServer, clinicKey, accountId, data }: { clinicSe
 		await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 	}
 
+	if (errorMsg) return errorMsg;
 	return true;
 }
 
@@ -212,8 +204,8 @@ export default {
 
 		if (url.pathname == "/push" && request.method == "POST") {
 			const body = await request.text();
-			const { clinicServer, clinicKey, accountId, data } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountId: string, data: Object };
-			const result = await pushData({ clinicServer, clinicKey, accountId, data });
+			const { clinicServer, clinicKey, accountIds, data } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object };
+			const result = await pushData({ clinicServer, clinicKey, accountIds, data });
 			if (typeof result == "string") return corsRes(result, 400);
 			return corsRes("ok", 200);
 		}
