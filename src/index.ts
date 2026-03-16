@@ -144,7 +144,14 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 		return [token, sendFCM({ oauth, token, data })];
 	});
 
-	const responses = await Promise.all(requests.map((request) => request[1]));
+	const responses: Response[] = [];
+
+	// Process in chunks of 40 to avoid hitting Cloudflare's 50 concurrent fetch limit
+	for (let i = 0; i < requests.length; i += 40) {
+		const chunk = requests.slice(i, i + 40);
+		const chunkResponses = await Promise.all(chunk.map((req) => req[1]));
+		responses.push(...chunkResponses);
+	}
 
 	let errorMsg: string | null = null;
 	for (let index = 0; index < responses.length; index++) {
