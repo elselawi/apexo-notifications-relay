@@ -165,12 +165,26 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 	}
 
 	if (failedTokens.length > 0) {
-		// remove tokens that failed
-		for (const token of failedTokens) {
-			delete clinic.devices[token];
+		// Re-fetch the clinic to minimize race conditions with concurrent device registrations
+		// since the FCM network requests take time and might overlap with a user logging in.
+		const currentValue = await env.apexo_notifications_relay.get(clinicServer);
+		if (currentValue != null) {
+			const currentClinic = new ClinicServer({ server: clinicServer, value: currentValue });
+			let clinicModified = false;
+
+			// remove tokens that failed
+			for (const token of failedTokens) {
+				if (currentClinic.devices[token] != null) {
+					delete currentClinic.devices[token];
+					clinicModified = true;
+				}
+			}
+
+			// update the clinic only if we actually deleted something
+			if (clinicModified) {
+				await env.apexo_notifications_relay.put(clinicServer, currentClinic.toSaveString());
+			}
 		}
-		// update the clinic
-		await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 	}
 
 	if (errorMsg) return errorMsg;
