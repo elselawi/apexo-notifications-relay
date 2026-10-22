@@ -8,6 +8,9 @@ declare namespace Cloudflare {
 	interface Env {
 		apexo_notifications_relay: KVNamespace;
         FIREBASE_SERVICE_ACCOUNT: string;
+        WNS_TENANT_ID: string;
+        WNS_CLIENT_ID: string;
+        WNS_CLIENT_SECRET: string;
 	}
 }
 interface Env extends Cloudflare.Env {}
