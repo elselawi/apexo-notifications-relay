@@ -17,24 +17,29 @@ class ClinicServer {
 	server: string;
 	key: string;
 	devices: Record<string, string>; // where the key is the FCM token and the value is the account ID
+	// The platform each token runs on, so a push can be shaped per device.
+	// Absent for devices registered before this was recorded.
+	platforms: Record<string, string>;
 
 	constructor({ server, value }: { server: string, value: string }) {
-		const { key, devices } = JSON.parse(value) as { key: string, devices: Record<string, string> };
+		const { key, devices, platforms } = JSON.parse(value) as { key: string, devices: Record<string, string>, platforms?: Record<string, string> };
 		this.server = server;
 		this.key = key;
 		this.devices = devices;
+		this.platforms = platforms ?? {};
 	}
 
 	toSaveString() {
 		return JSON.stringify({
 			key: this.key,
-			devices: this.devices
+			devices: this.devices,
+			platforms: this.platforms
 		});
 	}
 }
 
 
-async function putDevice({ clinicServer, clinicKey, deviceToken, accountId }: { clinicServer: string, clinicKey: string, deviceToken: string, accountId: string }): Promise<true | string> {
+async function putDevice({ clinicServer, clinicKey, deviceToken, accountId, platform }: { clinicServer: string, clinicKey: string, deviceToken: string, accountId: string, platform?: string }): Promise<true | string> {
 	for (const arg of [clinicServer, clinicKey, deviceToken, accountId]) {
 		if (arg == "" || arg == null) return "missing parameters";
 	}
@@ -45,16 +50,21 @@ async function putDevice({ clinicServer, clinicKey, deviceToken, accountId }: { 
 	if (value != null) {
 		const clinic = new ClinicServer({ server: clinicServer, value });
 		if (clinic.key == clinicKey) {
-			// add or update device token
-			if (clinic.devices[deviceToken] === accountId) return true;
+			// add or update device token, and the platform that shapes its pushes
+			const unchanged = clinic.devices[deviceToken] === accountId &&
+				(platform == null || platform == "" || clinic.platforms[deviceToken] === platform);
+			if (unchanged) return true;
 			clinic.devices[deviceToken] = accountId;
+			if (platform != null && platform != "") clinic.platforms[deviceToken] = platform;
 			await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 			return true
 		} else return "clinic key does not match";
 	} else {
 		const devices: Record<string, string> = {};
 		devices[deviceToken] = accountId;
-		const clinic = new ClinicServer({ server: clinicServer, value: JSON.stringify({ key: clinicKey, devices }) });
+		const platforms: Record<string, string> = {};
+		if (platform != null && platform != "") platforms[deviceToken] = platform;
+		const clinic = new ClinicServer({ server: clinicServer, value: JSON.stringify({ key: clinicKey, devices, platforms }) });
 		await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 		return true;
 	}
@@ -81,12 +91,68 @@ async function replaceToken({ clinicServer, clinicKey, oldToken, newToken }: { c
 
 	clinic.devices[newToken] = clinic.devices[oldToken];
 	delete clinic.devices[oldToken];
+	const platform = clinic.platforms[oldToken];
+	if (platform != null) {
+		clinic.platforms[newToken] = platform;
+		delete clinic.platforms[oldToken];
+	}
 	await env.apexo_notifications_relay.put(clinicServer, clinic.toSaveString());
 	return true
 
 }
 
-async function sendFCM({ oauth, token, data }: { oauth: string, token: string, data: Object }): Promise<Response> {
+type Alert = { title: string, body: string };
+
+/// The FCM message for one device.
+///
+/// An iOS device that has an [alert] gets an alert push, so iOS displays the
+/// notice itself — including when the app was never running. Every other
+/// device gets the data-only push the app renders.
+function fcmMessage(token: string, data: Object, alert?: Alert) {
+	if (alert != null) {
+		return {
+			token,
+			data,
+			apns: {
+				headers: {
+					"apns-push-type": "alert",
+					"apns-priority": "10"
+				},
+				payload: {
+					aps: {
+						alert: { title: alert.title, body: alert.body },
+						sound: "default",
+						badge: 1
+					}
+				}
+			}
+		};
+	}
+
+	return {
+		token,
+		data,
+		android: {
+			// Data-only messages default to normal priority, which Doze and
+			// App Standby may defer until the app is next opened. High
+			// priority is delivered while the app is backgrounded.
+			priority: "high"
+		},
+		apns: {
+			headers: {
+				"apns-push-type": "background",
+				"apns-priority": "5"
+			},
+			payload: {
+				aps: {
+					"content-available": 1
+				}
+			}
+		}
+	};
+}
+
+async function sendFCM({ oauth, token, data, alert }: { oauth: string, token: string, data: Object, alert?: Alert }): Promise<Response> {
 	const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT) as GoogleKey;
 
 	try {
@@ -97,27 +163,7 @@ async function sendFCM({ oauth, token, data }: { oauth: string, token: string, d
 				"Authorization": `Bearer ${oauth}`
 			},
 			body: JSON.stringify({
-				message: {
-					token,
-					data,
-					android: {
-						// Data-only messages default to normal priority, which Doze and
-						// App Standby may defer until the app is next opened. High
-						// priority is delivered while the app is backgrounded.
-						priority: "high"
-					},
-					apns: {
-						headers: {
-							"apns-push-type": "background",
-							"apns-priority": "5"
-						},
-						payload: {
-							aps: {
-								"content-available": 1
-							}
-						}
-					}
-				}
+				message: fcmMessage(token, data, alert)
 			})
 		});
 	} catch (error) {
@@ -145,9 +191,12 @@ type PushResult =
 	| { ok: true }
 	| { ok: false; status: 400 | 503; message: string };
 
-async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object }): Promise<PushResult> {
+async function pushData({ clinicServer, clinicKey, accountIds, data, alert }: { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object, alert?: Alert }): Promise<PushResult> {
 	for (const arg of [clinicServer, clinicKey, accountIds, data]) {
 		if (arg == "" || arg == null) return { ok: false, status: 400, message: "missing parameters" };
+	}
+	if (alert != null && (typeof alert.title != "string" || alert.title == "" || typeof alert.body != "string" || alert.body == "")) {
+		return { ok: false, status: 400, message: "invalid alert" };
 	}
 
 	clinicKey = await hashKey(clinicKey);
@@ -171,7 +220,12 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 	const failedTokens: string[] = [];
 
 	const requests: [string, Promise<Response>][] = targetTokens.map((token) => {
-		return [token, sendFCM({ oauth, token, data })];
+		// Only iOS gets an alert, so the system shows the notice even when the
+		// app is not running. macOS keeps the silent push (it only notifies
+		// while running), and tokens registered before the platform was
+		// recorded keep today's behaviour.
+		const tokenAlert = clinic.platforms[token] == "ios" ? alert : undefined;
+		return [token, sendFCM({ oauth, token, data, alert: tokenAlert })];
 	});
 
 	const responses: Response[] = [];
@@ -222,6 +276,7 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 			for (const token of failedTokens) {
 				if (currentClinic.devices[token] != null) {
 					delete currentClinic.devices[token];
+					delete currentClinic.platforms[token];
 					clinicModified = true;
 				}
 			}
@@ -260,8 +315,8 @@ export default {
 
 		if (url.pathname == "/put-device" && request.method == "POST") {
 			const body = await request.text();
-			const { clinicServer, clinicKey, deviceToken, accountId } = JSON.parse(body) as { clinicServer: string, clinicKey: string, deviceToken: string, accountId: string };
-			const result = await putDevice({ clinicServer, clinicKey, deviceToken, accountId });
+			const { clinicServer, clinicKey, deviceToken, accountId, platform } = JSON.parse(body) as { clinicServer: string, clinicKey: string, deviceToken: string, accountId: string, platform?: string };
+			const result = await putDevice({ clinicServer, clinicKey, deviceToken, accountId, platform });
 			if (typeof result == "string") return corsRes(result, 400);
 			return corsRes("ok", 200);
 		}
@@ -276,8 +331,8 @@ export default {
 
 		if (url.pathname == "/push" && request.method == "POST") {
 			const body = await request.text();
-			const { clinicServer, clinicKey, accountIds, data } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object };
-			const result = await pushData({ clinicServer, clinicKey, accountIds, data });
+			const { clinicServer, clinicKey, accountIds, data, alert } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object, alert?: Alert };
+			const result = await pushData({ clinicServer, clinicKey, accountIds, data, alert });
 			if (!result.ok) return corsRes(result.message, result.status);
 			return corsRes("ok", 200);
 		}

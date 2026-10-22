@@ -21,6 +21,36 @@ For Android devices, each message carries `android.priority = "high"` so the
 data message is delivered while the app is backgrounded instead of being
 deferred by Doze or App Standby. Web targets ignore both platform blocks.
 
+### iOS alerts
+
+A request may carry an `alert`:
+
+```json
+{
+  "clinicServer": "…",
+  "clinicKey": "…",
+  "accountIds": ["…"],
+  "data": { "payload": "{…}" },
+  "alert": { "title": "New appointment", "body": "Ada Lovelace: appointment created" }
+}
+```
+
+`/put-device` records the `platform` a token runs on (`ios`, `macos`, `android`,
+`web`). Tokens recorded as `ios` receive an alert push instead of the silent
+one, so iOS displays the notice itself — including when the app is not running:
+
+- `apns.headers["apns-push-type"] = "alert"`
+- `apns.headers["apns-priority"] = "10"`
+- `apns.payload.aps` = `{ alert, sound: "default", badge: 1 }`
+
+No `content-available` is sent with an alert, so the app is not woken and does
+not post a second notification for the same event. Tapping the alert opens the
+app with `data` attached, which is what the client navigates with.
+
+Every other token — macOS, Android, Web, and any device registered before
+`platform` existed — keeps the silent data push. The text in `alert` is rendered
+by the sending client, so it is in the sender's language.
+
 ## Response codes
 
 `/push` responds with:

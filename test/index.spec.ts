@@ -27,7 +27,7 @@ function mockOAuthToken() {
 		.reply(200, JSON.stringify({ access_token: 'test-access-token' }));
 }
 
-async function putDeviceViaApi(token = DEVICE_TOKEN) {
+async function putDeviceViaApi(token = DEVICE_TOKEN, platform?: string) {
 	const request = new IncomingRequest('http://example.com/put-device', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -35,12 +35,15 @@ async function putDeviceViaApi(token = DEVICE_TOKEN) {
 			clinicKey: CLINIC_KEY,
 			deviceToken: token,
 			accountId: ACCOUNT_ID,
+			...(platform == null ? {} : { platform }),
 		}),
 	});
 	return await worker.fetch(request);
 }
 
-async function push(accountIds: string[] = [ACCOUNT_ID]) {
+const ALERT = { title: 'New appointment', body: 'Ada Lovelace: appointment created' };
+
+async function push(accountIds: string[] = [ACCOUNT_ID], alert?: { title: string; body: string }) {
 	const request = new IncomingRequest('http://example.com/push', {
 		method: 'POST',
 		body: JSON.stringify({
@@ -48,9 +51,29 @@ async function push(accountIds: string[] = [ACCOUNT_ID]) {
 			clinicKey: CLINIC_KEY,
 			accountIds,
 			data: { title: 'hello' },
+			...(alert == null ? {} : { alert }),
 		}),
 	});
 	return await worker.fetch(request);
+}
+
+/// Answers FCM, and returns the message bodies it was given.
+function captureFcm() {
+	const bodies: Record<string, unknown>[] = [];
+	fetchMock
+		.get(FCM_ORIGIN)
+		.intercept({
+			method: 'POST',
+			path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+		})
+		.reply((opts) => {
+			bodies.push(JSON.parse(opts.body as string));
+			return {
+				statusCode: 200,
+				data: JSON.stringify({ name: 'projects/test-project/messages/msg-1' }),
+			};
+		});
+	return bodies;
 }
 
 // `cleanMocks()` exists at runtime on each per-origin mock client but is not
@@ -144,6 +167,86 @@ describe('Apexo Notifications Relay', () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe('ok');
 		expect(fcmCalled).toBe(true);
+	});
+
+	it('sends an iOS device an alert push, which the system displays on its own', async () => {
+		await putDeviceViaApi(DEVICE_TOKEN, 'ios');
+		mockOAuthToken();
+		const bodies = captureFcm();
+
+		const response = await push([ACCOUNT_ID], ALERT);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('ok');
+
+		expect(bodies).toHaveLength(1);
+		const message = bodies[0].message as Record<string, unknown>;
+		expect(message.token).toBe(DEVICE_TOKEN);
+		expect(message.data).toEqual({ title: 'hello' });
+		expect(message.notification).toBeUndefined();
+		expect(message.android).toBeUndefined();
+		expect(message.apns).toEqual({
+			headers: { 'apns-push-type': 'alert', 'apns-priority': '10' },
+			payload: {
+				aps: {
+					alert: { title: ALERT.title, body: ALERT.body },
+					sound: 'default',
+					badge: 1,
+				},
+			},
+		});
+	});
+
+	it('keeps the silent push for a Mac, even when an alert is offered', async () => {
+		await putDeviceViaApi(DEVICE_TOKEN, 'macos');
+		mockOAuthToken();
+		const bodies = captureFcm();
+
+		const response = await push([ACCOUNT_ID], ALERT);
+		expect(response.status).toBe(200);
+
+		const message = bodies[0].message as Record<string, unknown>;
+		expect(message.android).toEqual({ priority: 'high' });
+		expect(message.apns).toEqual({
+			headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
+			payload: { aps: { 'content-available': 1 } },
+		});
+	});
+
+	it('moves the platform with the token on /replace-token', async () => {
+		await putDeviceViaApi('old-token', 'ios');
+		mockOAuthToken();
+
+		const replaced = await worker.fetch(
+			new IncomingRequest('http://example.com/replace-token', {
+				method: 'POST',
+				body: JSON.stringify({
+					clinicServer: CLINIC_SERVER,
+					clinicKey: CLINIC_KEY,
+					oldToken: 'old-token',
+					newToken: 'new-token',
+				}),
+			})
+		);
+		expect(replaced.status).toBe(200);
+
+		const bodies = captureFcm();
+		const response = await push([ACCOUNT_ID], ALERT);
+		expect(response.status).toBe(200);
+
+		const message = bodies[0].message as Record<string, unknown>;
+		expect(message.token).toBe('new-token');
+		expect((message.apns as Record<string, unknown>).headers).toEqual({
+			'apns-push-type': 'alert',
+			'apns-priority': '10',
+		});
+	});
+
+	it('rejects an alert without a title and body', async () => {
+		await putDeviceViaApi(DEVICE_TOKEN, 'ios');
+		mockOAuthToken();
+
+		const response = await push([ACCOUNT_ID], { title: '', body: 'body' });
+		expect(response.status).toBe(400);
 	});
 
 	it('removes the token when FCM responds with 404', async () => {
