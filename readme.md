@@ -17,7 +17,9 @@ update:
 - `apns.headers["apns-priority"] = "5"`
 - `apns.payload.aps["content-available"] = 1`
 
-Android/Web targets ignore the APNs block.
+For Android devices, each message carries `android.priority = "high"` so the
+data message is delivered while the app is backgrounded instead of being
+deferred by Doze or App Standby. Web targets ignore both platform blocks.
 
 ## Response codes
 

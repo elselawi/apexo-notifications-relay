@@ -79,7 +79,7 @@ describe('Apexo Notifications Relay', () => {
 		expect(await response.text()).toBe('ok');
 	});
 
-	it('sends the expected FCM request including the APNs block', async () => {
+	it('sends the expected FCM request including the Android and APNs blocks', async () => {
 		await putDeviceViaApi();
 		mockOAuthToken();
 
@@ -107,6 +107,7 @@ describe('Apexo Notifications Relay', () => {
 		expect(message.token).toBe(DEVICE_TOKEN);
 		expect(message.data).toEqual({ title: 'hello' });
 		expect(message.notification).toBeUndefined();
+		expect(message.android).toEqual({ priority: 'high' });
 		expect(message.apns).toEqual({
 			headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
 			payload: { aps: { 'content-available': 1 } },

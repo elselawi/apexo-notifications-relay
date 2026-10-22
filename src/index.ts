@@ -100,6 +100,12 @@ async function sendFCM({ oauth, token, data }: { oauth: string, token: string, d
 				message: {
 					token,
 					data,
+					android: {
+						// Data-only messages default to normal priority, which Doze and
+						// App Standby may defer until the app is next opened. High
+						// priority is delivered while the app is backgrounded.
+						priority: "high"
+					},
 					apns: {
 						headers: {
 							"apns-push-type": "background",
