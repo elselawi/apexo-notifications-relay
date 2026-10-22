@@ -89,16 +89,36 @@ async function replaceToken({ clinicServer, clinicKey, oldToken, newToken }: { c
 async function sendFCM({ oauth, token, data }: { oauth: string, token: string, data: Object }): Promise<Response> {
 	const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT) as GoogleKey;
 
-	return await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"Authorization": `Bearer ${oauth}`
-		},
-		body: JSON.stringify({
-			message: { token, data }
-		})
-	});
+	try {
+		return await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${oauth}`
+			},
+			body: JSON.stringify({
+				message: {
+					token,
+					data,
+					apns: {
+						headers: {
+							"apns-push-type": "background",
+							"apns-priority": "5"
+						},
+						payload: {
+							aps: {
+								"content-available": 1
+							}
+						}
+					}
+				}
+			})
+		});
+	} catch (error) {
+		// Network/abort failures are transient: surface them as retryable so the
+		// caller returns HTTP 503 and the client retries instead of dropping the push.
+		return new Response("FCM request failed", { status: 503 });
+	}
 }
 
 async function getFCMAuth(): Promise<string> {
@@ -115,25 +135,29 @@ async function getFCMAuth(): Promise<string> {
 	return res;
 }
 
-async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object }): Promise<true | string> {
+type PushResult =
+	| { ok: true }
+	| { ok: false; status: 400 | 503; message: string };
+
+async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object }): Promise<PushResult> {
 	for (const arg of [clinicServer, clinicKey, accountIds, data]) {
-		if (arg == "" || arg == null) return "missing parameters";
+		if (arg == "" || arg == null) return { ok: false, status: 400, message: "missing parameters" };
 	}
 
 	clinicKey = await hashKey(clinicKey);
 
 	const value = await env.apexo_notifications_relay.get(clinicServer);
-	if (value == null) return "clinic not found";
+	if (value == null) return { ok: false, status: 400, message: "clinic not found" };
 
 	const clinic = new ClinicServer({ server: clinicServer, value });
-	if (clinic.key != clinicKey) return "clinic key does not match";
+	if (clinic.key != clinicKey) return { ok: false, status: 400, message: "clinic key does not match" };
 
 	// Find all tokens that belong to the target accountIds
 	const targetTokens = Object.entries(clinic.devices)
 		.filter(([_, accountId]) => accountIds.includes(accountId))
 		.map(([token]) => token);
 
-	if (targetTokens.length == 0) return "none of the account ids were found to have FCM tokens: " + accountIds;
+	if (targetTokens.length == 0) return { ok: false, status: 400, message: "none of the account ids were found to have FCM tokens: " + accountIds };
 
 	// generate FCM access token
 	const oauth = await getFCMAuth();
@@ -153,14 +177,30 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 		responses.push(...chunkResponses);
 	}
 
-	let errorMsg: string | null = null;
+	let retryableError: string | null = null;
+	let permanentError: string | null = null;
 	for (let index = 0; index < responses.length; index++) {
 		const response = responses[index];
-		if (response.status == 404) {
+		const status = response.status;
+
+		if (status == 404) {
+			// Unregistered/invalid token: remove it below; not a failure for the caller.
 			failedTokens.push(requests[index][0]);
 		}
-		else if (response.status != 200 && errorMsg == null) {
-			errorMsg = await response.text();
+		else if (status >= 200 && status < 300) {
+			// Success: nothing to do.
+		}
+		else if (status == 401 || status == 403 || status == 429 || status >= 500) {
+			// Relay-side credential/rate-limit/server problem or transient 5xx: retryable.
+			if (retryableError == null) retryableError = await response.text();
+		}
+		else if (status >= 400 && status < 500) {
+			// Other 4xx: permanent client error.
+			if (permanentError == null) permanentError = await response.text();
+		}
+		else {
+			// Unexpected (e.g. 3xx): treat as transient so the client retries.
+			if (retryableError == null) retryableError = await response.text();
 		}
 	}
 
@@ -187,8 +227,11 @@ async function pushData({ clinicServer, clinicKey, accountIds, data }: { clinicS
 		}
 	}
 
-	if (errorMsg) return errorMsg;
-	return true;
+	// Prefer a permanent client error over a retryable one so the client stops
+	// retrying a push that can never succeed for one of its targets.
+	if (permanentError != null) return { ok: false, status: 400, message: permanentError };
+	if (retryableError != null) return { ok: false, status: 503, message: retryableError };
+	return { ok: true };
 }
 
 
@@ -229,7 +272,7 @@ export default {
 			const body = await request.text();
 			const { clinicServer, clinicKey, accountIds, data } = JSON.parse(body) as { clinicServer: string, clinicKey: string, accountIds: Array<string>, data: Object };
 			const result = await pushData({ clinicServer, clinicKey, accountIds, data });
-			if (typeof result == "string") return corsRes(result, 400);
+			if (!result.ok) return corsRes(result.message, result.status);
 			return corsRes("ok", 200);
 		}
 

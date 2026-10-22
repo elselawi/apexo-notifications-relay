@@ -1,24 +1,201 @@
-import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { env, fetchMock } from 'cloudflare:test';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import worker from '../src/index';
 
-// For now, you'll need to do something like this to get a correctly-typed
-// `Request` to pass to `worker.fetch()`.
+// A correctly-typed `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
-describe('Hello World worker', () => {
-	it('responds with Hello World! (unit style)', async () => {
-		const request = new IncomingRequest('http://example.com');
-		// Create an empty context to pass to `worker.fetch()`.
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
-		await waitOnExecutionContext(ctx);
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+const CLINIC_SERVER = 'clinic-1';
+const CLINIC_KEY = 'clinic-secret-key';
+const ACCOUNT_ID = 'account-1';
+const DEVICE_TOKEN = 'device-token-1';
+const FCM_PROJECT = 'test-project';
+const FCM_ORIGIN = 'https://fcm.googleapis.com';
+const OAUTH_ORIGIN = 'https://oauth2.googleapis.com';
+
+async function hashKey(key: string): Promise<string> {
+	const msgUint8 = new TextEncoder().encode(key);
+	const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+	const hashArray = Array.from(new Uint8Array(hashBuffer));
+	return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function mockOAuthToken() {
+	fetchMock
+		.get(OAUTH_ORIGIN)
+		.intercept({ method: 'POST', path: '/token' })
+		.reply(200, JSON.stringify({ access_token: 'test-access-token' }));
+}
+
+async function putDeviceViaApi(token = DEVICE_TOKEN) {
+	const request = new IncomingRequest('http://example.com/put-device', {
+		method: 'POST',
+		body: JSON.stringify({
+			clinicServer: CLINIC_SERVER,
+			clinicKey: CLINIC_KEY,
+			deviceToken: token,
+			accountId: ACCOUNT_ID,
+		}),
+	});
+	return await worker.fetch(request);
+}
+
+async function push(accountIds: string[] = [ACCOUNT_ID]) {
+	const request = new IncomingRequest('http://example.com/push', {
+		method: 'POST',
+		body: JSON.stringify({
+			clinicServer: CLINIC_SERVER,
+			clinicKey: CLINIC_KEY,
+			accountIds,
+			data: { title: 'hello' },
+		}),
+	});
+	return await worker.fetch(request);
+}
+
+// `cleanMocks()` exists at runtime on each per-origin mock client but is not
+// exposed by the `Interceptable` type, so cast around it.
+function cleanFetchMocks() {
+	const cleanable = (origin: string) =>
+		(fetchMock.get(origin) as unknown as { cleanMocks(): void }).cleanMocks();
+	cleanable(FCM_ORIGIN);
+	cleanable(OAUTH_ORIGIN);
+}
+
+describe('Apexo Notifications Relay', () => {
+	beforeAll(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
 	});
 
-	it('responds with Hello World! (integration style)', async () => {
-		const response = await SELF.fetch('https://example.com');
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+	beforeEach(() => {
+		cleanFetchMocks();
+	});
+
+	it('responds to /health with "ok"', async () => {
+		const request = new IncomingRequest('http://example.com/health');
+		const response = await worker.fetch(request);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('ok');
+	});
+
+	it('sends the expected FCM request including the APNs block', async () => {
+		await putDeviceViaApi();
+		mockOAuthToken();
+
+		let capturedBody: Record<string, unknown> | null = null;
+		fetchMock
+			.get(FCM_ORIGIN)
+			.intercept({
+				method: 'POST',
+				path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+			})
+			.reply((opts) => {
+				capturedBody = JSON.parse(opts.body as string);
+				return {
+					statusCode: 200,
+					data: JSON.stringify({ name: 'projects/test-project/messages/msg-1' }),
+				};
+			});
+
+		const response = await push();
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('ok');
+
+		expect(capturedBody).not.toBeNull();
+		const message = capturedBody!.message as Record<string, unknown>;
+		expect(message.token).toBe(DEVICE_TOKEN);
+		expect(message.data).toEqual({ title: 'hello' });
+		expect(message.notification).toBeUndefined();
+		expect(message.apns).toEqual({
+			headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
+			payload: { aps: { 'content-available': 1 } },
+		});
+	});
+
+	it('sends FCM for legacy device records whose device value is a string', async () => {
+		// Legacy record shape: `devices` maps an FCM token to a plain-string account ID.
+		await env.apexo_notifications_relay.put(
+			CLINIC_SERVER,
+			JSON.stringify({
+				key: await hashKey(CLINIC_KEY),
+				devices: { [DEVICE_TOKEN]: ACCOUNT_ID },
+			})
+		);
+		mockOAuthToken();
+
+		let fcmCalled = false;
+		fetchMock
+			.get(FCM_ORIGIN)
+			.intercept({
+				method: 'POST',
+				path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+			})
+			.reply(() => {
+				fcmCalled = true;
+				return {
+					statusCode: 200,
+					data: JSON.stringify({ name: 'projects/test-project/messages/msg-1' }),
+				};
+			});
+
+		const response = await push();
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('ok');
+		expect(fcmCalled).toBe(true);
+	});
+
+	it('removes the token when FCM responds with 404', async () => {
+		await putDeviceViaApi();
+		mockOAuthToken();
+
+		fetchMock
+			.get(FCM_ORIGIN)
+			.intercept({
+				method: 'POST',
+				path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+			})
+			.reply(404, JSON.stringify({ error: { message: 'unregistered token' } }));
+
+		const response = await push();
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('ok');
+
+		const stored = await env.apexo_notifications_relay.get(CLINIC_SERVER);
+		expect(stored).not.toBeNull();
+		const clinic = JSON.parse(stored!) as { devices: Record<string, string> };
+		expect(clinic.devices[DEVICE_TOKEN]).toBeUndefined();
+	});
+
+	it('maps FCM 500 to HTTP 503 (retryable)', async () => {
+		await putDeviceViaApi();
+		mockOAuthToken();
+
+		fetchMock
+			.get(FCM_ORIGIN)
+			.intercept({
+				method: 'POST',
+				path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+			})
+			.reply(500, 'Internal Server Error');
+
+		const response = await push();
+		expect(response.status).toBe(503);
+	});
+
+	it('maps FCM 400 to HTTP 400 (permanent)', async () => {
+		await putDeviceViaApi();
+		mockOAuthToken();
+
+		fetchMock
+			.get(FCM_ORIGIN)
+			.intercept({
+				method: 'POST',
+				path: `/v1/projects/${FCM_PROJECT}/messages:send`,
+			})
+			.reply(400, 'Bad Request');
+
+		const response = await push();
+		expect(response.status).toBe(400);
 	});
 });
